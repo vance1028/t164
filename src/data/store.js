@@ -188,9 +188,14 @@ async function listOrders({ elderId, mealId, status } = {}, conn) {
   const c = w.length ? `WHERE ${w.join(' AND ')}` : '';
   const [r] = await exec(conn, `SELECT * FROM orders ${c} ORDER BY id DESC`, p); return r.map(mapOrder);
 }
-async function getOrderById(id, conn) { const [r] = await exec(conn, 'SELECT * FROM orders WHERE id=?', [id]); return mapOrder(r[0]); }
-async function getOrderByElderAndMeal(elderId, mealId, conn) {
-  const [r] = await exec(conn, 'SELECT * FROM orders WHERE elder_id=? AND meal_id=?', [elderId, mealId]);
+async function getOrderById(id, conn, forUpdate) {
+  const sql = forUpdate ? 'SELECT * FROM orders WHERE id=? FOR UPDATE' : 'SELECT * FROM orders WHERE id=?';
+  const [r] = await exec(conn, sql, [id]);
+  return mapOrder(r[0]);
+}
+async function getOrderByElderAndMeal(elderId, mealId, conn, forUpdate) {
+  const sql = forUpdate ? 'SELECT * FROM orders WHERE elder_id=? AND meal_id=? FOR UPDATE' : 'SELECT * FROM orders WHERE elder_id=? AND meal_id=?';
+  const [r] = await exec(conn, sql, [elderId, mealId]);
   return mapOrder(r[0]);
 }
 async function createOrder(d, conn) {
@@ -204,6 +209,13 @@ async function updateOrder(id, d, conn) {
   for (const [k, col] of Object.entries(map)) if (d[k] !== undefined) { sets.push(`${col}=?`); p.push(d[k]); }
   if (sets.length) { sets.push('updated_at=CURRENT_TIMESTAMP(3)'); p.push(id); await exec(conn, `UPDATE orders SET ${sets.join(',')} WHERE id=?`, p); }
   return getOrderById(id, conn);
+}
+async function markOrderServed(id, conn) {
+  const [r] = await exec(conn,
+    "UPDATE orders SET status='SERVED', updated_at=CURRENT_TIMESTAMP(3) WHERE id=? AND status='RESERVED'",
+    [id]
+  );
+  return r.affectedRows;
 }
 
 /* ----------------------------- 代领授权 ----------------------------- */
@@ -388,7 +400,7 @@ module.exports = {
   listCanteens, getCanteenById, getCanteenByCode, createCanteen, updateCanteen, deleteCanteen,
   listElders, getElderById, getElderByCode, createElder, updateElder, deleteElder,
   listMeals, getMealById, createMeal, updateMeal, deleteMeal,
-  listOrders, getOrderById, getOrderByElderAndMeal, createOrder, updateOrder,
+  listOrders, getOrderById, getOrderByElderAndMeal, createOrder, updateOrder, markOrderServed,
   listAuthorizations, getAuthorizationById, findActiveAuthorization, createAuthorization, revokeAuthorization, updateAuthorization,
   listVerifications, getVerificationById, getVerificationByOfflineToken, getValidVerificationByElderAndMeal, createVerification, updateVerificationStatus,
   listSyncBatches, getSyncBatchById, getSyncBatchByCode, createSyncBatch, updateSyncBatch,

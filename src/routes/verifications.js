@@ -15,7 +15,7 @@ router.use(authRequired);
 
 async function performOnlineVerify({ orderId, pickupElderId, pickupType, proxyIdCode, canteenId, verifierId, verifiedAt }) {
   return store.withTransaction(async (conn) => {
-    const order = await store.getOrderById(orderId, conn);
+    const order = await store.getOrderById(orderId, conn, true);
     const at = verifiedAt || nowIso();
 
     if (!order) throw new VerificationError(CONFLICT_TYPES.NO_ORDER, '订餐不存在');
@@ -43,14 +43,25 @@ async function performOnlineVerify({ orderId, pickupElderId, pickupType, proxyId
       order, pickupElderId, pickupType, proxyAuthorization, at, existingVerification, elder,
     });
 
-    await store.updateOrder(orderId, { status: 'SERVED' }, conn);
+    const affected = await store.markOrderServed(orderId, conn);
+    if (affected === 0) {
+      throw new VerificationError(CONFLICT_TYPES.ALREADY_SERVED, '该订单已被核销（并发竞争），请勿重复领取');
+    }
 
     const record = buildVerificationRecord({
       order, meal, pickupType, elder, proxyAuthorization,
       proxyIdCode, verifierId, verifyChannel: VERIFY_CHANNELS.ONLINE,
       verifiedAt: at, status: 'VALID',
     });
-    const verification = await store.createVerification(record, conn);
+    let verification;
+    try {
+      verification = await store.createVerification(record, conn);
+    } catch (e) {
+      if (e && e.code === 'ER_DUP_ENTRY') {
+        throw new VerificationError(CONFLICT_TYPES.ALREADY_SERVED, '该订单已被核销（唯一约束拦截重复领取）');
+      }
+      throw e;
+    }
     const updatedOrder = await store.getOrderById(orderId, conn);
     return { order: updatedOrder, verification };
   });
@@ -142,7 +153,7 @@ router.post('/offline-sync', requireRole('ADMIN', 'OPERATOR'), async (req, res, 
     for (const rec of records) {
       try {
         const result = await store.withTransaction(async (conn) => {
-          const order = rec.orderId ? await store.getOrderById(rec.orderId, conn) : null;
+          const order = rec.orderId ? await store.getOrderById(rec.orderId, conn, true) : null;
           const meal = order ? await store.getMealById(order.mealId, conn) : null;
           const existingByToken = await store.getVerificationByOfflineToken(rec.offlineToken, conn);
           const existingByElderMeal = order
@@ -207,7 +218,24 @@ router.post('/offline-sync', requireRole('ADMIN', 'OPERATOR'), async (req, res, 
             }
 
             if (order.status === 'RESERVED') {
-              await store.updateOrder(order.id, { status: 'SERVED' }, conn);
+              const served = await store.markOrderServed(order.id, conn);
+              if (served === 0) {
+                await store.createConflict({
+                  syncBatchId: batch.id,
+                  orderId: order.id,
+                  offlineToken: rec.offlineToken,
+                  offlineVerifiedAt: rec.verifiedAt || at,
+                  existingStatus: 'SERVED',
+                  existingVerifiedAt: resolution.existingVerification ? resolution.existingVerification.verifiedAt : null,
+                  conflictType: CONFLICT_TYPES.ALREADY_SERVED,
+                  resolution: RESOLUTIONS.REJECT,
+                  note: '离线补传时订单已被并发核销，重复领取拒绝',
+                }, conn);
+                itemResult.resolution = RESOLUTIONS.REJECT;
+                itemResult.conflictType = CONFLICT_TYPES.ALREADY_SERVED;
+                itemResult.note = '订单已被并发核销';
+                return itemResult;
+              }
             }
 
             const verificationRecord = buildVerificationRecord({
@@ -219,7 +247,29 @@ router.post('/offline-sync', requireRole('ADMIN', 'OPERATOR'), async (req, res, 
               syncedAt: at, syncBatchId: batch.id,
               status: 'VALID',
             });
-            const created = await store.createVerification(verificationRecord, conn);
+            let created;
+            try {
+              created = await store.createVerification(verificationRecord, conn);
+            } catch (e) {
+              if (e && e.code === 'ER_DUP_ENTRY') {
+                await store.createConflict({
+                  syncBatchId: batch.id,
+                  orderId: order.id,
+                  offlineToken: rec.offlineToken,
+                  offlineVerifiedAt: rec.verifiedAt || at,
+                  existingStatus: order.status,
+                  existingVerifiedAt: resolution.existingVerification ? resolution.existingVerification.verifiedAt : null,
+                  conflictType: CONFLICT_TYPES.DUPLICATE_TOKEN,
+                  resolution: RESOLUTIONS.REJECT,
+                  note: '唯一约束拦截：该笔离线记录与线上已存在 VALID 核销冲突',
+                }, conn);
+                itemResult.resolution = RESOLUTIONS.REJECT;
+                itemResult.conflictType = CONFLICT_TYPES.DUPLICATE_TOKEN;
+                itemResult.note = '唯一约束拦截重复核销';
+                return itemResult;
+              }
+              throw e;
+            }
             itemResult.verificationId = created.id;
 
             if (resolution.conflictType && resolution.resolution === RESOLUTIONS.SUPERSEDED) {

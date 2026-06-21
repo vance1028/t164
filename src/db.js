@@ -33,6 +33,41 @@ async function ensureSchema() {
   } finally {
     await conn.end();
   }
+  await migrateSchema();
+}
+
+async function migrateSchema() {
+  const pool = getPool();
+  const [cols] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'verification_records'
+       AND COLUMN_NAME IN ('valid_order_key','valid_elder_meal_key')`
+  );
+  const hasCol = new Set(cols.map((c) => c.COLUMN_NAME));
+  if (!hasCol.has('valid_order_key')) {
+    await pool.query(
+      `ALTER TABLE verification_records ADD COLUMN valid_order_key INT UNSIGNED
+       GENERATED ALWAYS AS (CASE WHEN status='VALID' THEN order_id ELSE NULL END) VIRTUAL`
+    );
+  }
+  if (!hasCol.has('valid_elder_meal_key')) {
+    await pool.query(
+      `ALTER TABLE verification_records ADD COLUMN valid_elder_meal_key VARCHAR(60)
+       GENERATED ALWAYS AS (CASE WHEN status='VALID' THEN CONCAT(elder_id,'_',meal_id) ELSE NULL END) VIRTUAL`
+    );
+  }
+  const [idxs] = await pool.query(
+    `SELECT DISTINCT INDEX_NAME FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'verification_records'
+       AND INDEX_NAME IN ('uq_ver_valid_order','uq_ver_valid_elder_meal')`
+  );
+  const hasIdx = new Set(idxs.map((i) => i.INDEX_NAME));
+  if (!hasIdx.has('uq_ver_valid_order')) {
+    await pool.query(`ALTER TABLE verification_records ADD UNIQUE INDEX uq_ver_valid_order (valid_order_key)`);
+  }
+  if (!hasIdx.has('uq_ver_valid_elder_meal')) {
+    await pool.query(`ALTER TABLE verification_records ADD UNIQUE INDEX uq_ver_valid_elder_meal (valid_elder_meal_key)`);
+  }
 }
 
 async function resetAll() {
@@ -75,4 +110,4 @@ async function close() {
   if (pool) { await pool.end(); pool = null; }
 }
 
-module.exports = { getPool, ensureSchema, resetAll, waitForDb, close, DB_CONFIG };
+module.exports = { getPool, ensureSchema, migrateSchema, resetAll, waitForDb, close, DB_CONFIG };
