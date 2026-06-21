@@ -152,7 +152,8 @@ CREATE TABLE IF NOT EXISTS offline_sync_batches (
 CREATE TABLE IF NOT EXISTS verification_conflicts (
   id                INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   sync_batch_id     INT UNSIGNED NULL,
-  order_id          INT UNSIGNED NOT NULL,
+  order_id          INT UNSIGNED NULL,
+  unknown_order_id  VARCHAR(64) NULL,
   offline_token     VARCHAR(64) NULL,
   offline_verified_at DATETIME(3) NOT NULL,
   existing_status   VARCHAR(16) NOT NULL,
@@ -162,7 +163,7 @@ CREATE TABLE IF NOT EXISTS verification_conflicts (
   note              VARCHAR(255) NULL,
   created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   CONSTRAINT fk_conflict_batch FOREIGN KEY (sync_batch_id) REFERENCES offline_sync_batches(id) ON DELETE SET NULL,
-  CONSTRAINT fk_conflict_order FOREIGN KEY (order_id) REFERENCES orders(id),
+  CONSTRAINT fk_conflict_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL,
   INDEX idx_conflict_order (order_id),
   INDEX idx_conflict_type (conflict_type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
