@@ -4,8 +4,8 @@
 function sendData(res, status, data, extra = {}) {
   return res.status(status).json({ data, ...extra });
 }
-function sendError(res, status, message) {
-  return res.status(status).json({ error: { message } });
+function sendError(res, status, message, extra = {}) {
+  return res.status(status).json({ error: { message, ...extra } });
 }
 function parseId(raw) {
   const id = Number(raw);

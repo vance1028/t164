@@ -5,6 +5,22 @@ const { hashPassword } = require('../utils/password');
 
 /** 数据仓储层：SQL 集中此处，路由层只调用这些 async 方法，对外返回 camelCase。 */
 
+function toMysqlDateTime(v) {
+  if (!v) return v;
+  if (v instanceof Date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    const ms = String(v.getMilliseconds()).padStart(3, '0');
+    return `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())} ${pad(v.getHours())}:${pad(v.getMinutes())}:${pad(v.getSeconds())}.${ms}`;
+  }
+  if (typeof v === 'string') {
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(v)) return v;
+    const d = new Date(v);
+    if (isNaN(d.getTime())) return v;
+    return toMysqlDateTime(d);
+  }
+  return v;
+}
+
 /* ----------------------------- 映射 ----------------------------- */
 function mapUser(r) {
   if (!r) return null;
@@ -26,6 +42,47 @@ function mapMeal(r) {
 function mapOrder(r) {
   if (!r) return null;
   return { id: r.id, elderId: r.elder_id, mealId: r.meal_id, diningType: r.dining_type, qty: r.qty, amountCents: r.amount_cents, subsidyCents: r.subsidy_cents, payCents: r.pay_cents, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at };
+}
+function mapAuthorization(r) {
+  if (!r) return null;
+  return {
+    id: r.id, elderId: r.elder_id, authorizedBy: r.authorized_by,
+    proxyName: r.proxy_name, proxyPhone: r.proxy_phone, proxyIdCode: r.proxy_id_code,
+    validFrom: r.valid_from, validUntil: r.valid_until,
+    status: r.status, revokedAt: r.revoked_at, revokedBy: r.revoked_by,
+    note: r.note, createdAt: r.created_at, updatedAt: r.updated_at
+  };
+}
+function mapVerification(r) {
+  if (!r) return null;
+  return {
+    id: r.id, orderId: r.order_id, elderId: r.elder_id, mealId: r.meal_id,
+    canteenId: r.canteen_id, verifierId: r.verifier_id,
+    pickupType: r.pickup_type, proxyAuthId: r.proxy_auth_id,
+    proxyName: r.proxy_name, proxyIdCode: r.proxy_id_code,
+    verifyChannel: r.verify_channel, offlineToken: r.offline_token,
+    verifiedAt: r.verified_at, syncedAt: r.synced_at, syncBatchId: r.sync_batch_id,
+    status: r.status, conflictNote: r.conflict_note, createdAt: r.created_at
+  };
+}
+function mapSyncBatch(r) {
+  if (!r) return null;
+  return {
+    id: r.id, canteenId: r.canteen_id, operatorId: r.operator_id,
+    batchCode: r.batch_code, recordCount: r.record_count,
+    processedAt: r.processed_at, status: r.status,
+    summary: r.summary, createdAt: r.created_at
+  };
+}
+function mapConflict(r) {
+  if (!r) return null;
+  return {
+    id: r.id, syncBatchId: r.sync_batch_id, orderId: r.order_id,
+    offlineToken: r.offline_token, offlineVerifiedAt: r.offline_verified_at,
+    existingStatus: r.existing_status, existingVerifiedAt: r.existing_verified_at,
+    conflictType: r.conflict_type, resolution: r.resolution,
+    note: r.note, createdAt: r.created_at
+  };
 }
 
 /* ----------------------------- 用户 ----------------------------- */
@@ -142,12 +199,197 @@ async function updateOrder(id, d) {
   if (sets.length) { sets.push('updated_at=CURRENT_TIMESTAMP(3)'); p.push(id); await getPool().query(`UPDATE orders SET ${sets.join(',')} WHERE id=?`, p); }
   return getOrderById(id);
 }
+async function getOrderByElderAndMeal(elderId, mealId) {
+  const [r] = await getPool().query('SELECT * FROM orders WHERE elder_id=? AND meal_id=?', [elderId, mealId]);
+  return mapOrder(r[0]);
+}
+
+/* ----------------------------- 代领授权 ----------------------------- */
+async function listAuthorizations({ elderId, proxyIdCode, status } = {}) {
+  const w = []; const p = [];
+  if (elderId !== undefined) { w.push('elder_id=?'); p.push(elderId); }
+  if (proxyIdCode) { w.push('proxy_id_code=?'); p.push(proxyIdCode); }
+  if (status) { w.push('status=?'); p.push(status); }
+  const c = w.length ? `WHERE ${w.join(' AND ')}` : '';
+  const [r] = await getPool().query(`SELECT * FROM pickup_authorizations ${c} ORDER BY id DESC`, p);
+  return r.map(mapAuthorization);
+}
+async function getAuthorizationById(id) {
+  const [r] = await getPool().query('SELECT * FROM pickup_authorizations WHERE id=?', [id]);
+  return mapAuthorization(r[0]);
+}
+async function findActiveAuthorization(elderId, proxyIdCode, at) {
+  const atMysql = toMysqlDateTime(at);
+  const [r] = await getPool().query(
+    `SELECT * FROM pickup_authorizations
+     WHERE elder_id=? AND proxy_id_code=? AND status='ACTIVE'
+       AND valid_from<=? AND valid_until>=?`,
+    [elderId, proxyIdCode, atMysql, atMysql]
+  );
+  return mapAuthorization(r[0]);
+}
+async function createAuthorization(d) {
+  const [x] = await getPool().query(
+    `INSERT INTO pickup_authorizations (elder_id,authorized_by,proxy_name,proxy_phone,proxy_id_code,valid_from,valid_until,status,note)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [d.elderId, d.authorizedBy, d.proxyName, d.proxyPhone || '', d.proxyIdCode,
+     toMysqlDateTime(d.validFrom), toMysqlDateTime(d.validUntil), d.status || 'ACTIVE', d.note || '']
+  );
+  return getAuthorizationById(x.insertId);
+}
+async function revokeAuthorization(id, revokedBy, revokedAt) {
+  await getPool().query(
+    `UPDATE pickup_authorizations SET status='REVOKED', revoked_at=?, revoked_by=?, updated_at=CURRENT_TIMESTAMP(3) WHERE id=?`,
+    [toMysqlDateTime(revokedAt), revokedBy, id]
+  );
+  return getAuthorizationById(id);
+}
+async function updateAuthorization(id, d) {
+  const map = { validFrom: 'valid_from', validUntil: 'valid_until', note: 'note', proxyName: 'proxy_name', proxyPhone: 'proxy_phone' };
+  const sets = []; const p = [];
+  for (const [k, col] of Object.entries(map)) {
+    if (d[k] !== undefined) {
+      sets.push(`${col}=?`);
+      p.push((k === 'validFrom' || k === 'validUntil') ? toMysqlDateTime(d[k]) : d[k]);
+    }
+  }
+  if (sets.length) { sets.push('updated_at=CURRENT_TIMESTAMP(3)'); p.push(id); await getPool().query(`UPDATE pickup_authorizations SET ${sets.join(',')} WHERE id=?`, p); }
+  return getAuthorizationById(id);
+}
+
+/* ----------------------------- 核销记录 ----------------------------- */
+async function listVerifications({ orderId, elderId, mealId, canteenId, status, offlineToken } = {}) {
+  const w = []; const p = [];
+  if (orderId !== undefined) { w.push('order_id=?'); p.push(orderId); }
+  if (elderId !== undefined) { w.push('elder_id=?'); p.push(elderId); }
+  if (mealId !== undefined) { w.push('meal_id=?'); p.push(mealId); }
+  if (canteenId !== undefined) { w.push('canteen_id=?'); p.push(canteenId); }
+  if (status) { w.push('status=?'); p.push(status); }
+  if (offlineToken) { w.push('offline_token=?'); p.push(offlineToken); }
+  const c = w.length ? `WHERE ${w.join(' AND ')}` : '';
+  const [r] = await getPool().query(`SELECT * FROM verification_records ${c} ORDER BY verified_at DESC, id DESC`, p);
+  return r.map(mapVerification);
+}
+async function getVerificationById(id) {
+  const [r] = await getPool().query('SELECT * FROM verification_records WHERE id=?', [id]);
+  return mapVerification(r[0]);
+}
+async function getVerificationByOfflineToken(token) {
+  const [r] = await getPool().query('SELECT * FROM verification_records WHERE offline_token=?', [token]);
+  return mapVerification(r[0]);
+}
+async function getValidVerificationByElderAndMeal(elderId, mealId) {
+  const [r] = await getPool().query(
+    `SELECT * FROM verification_records WHERE elder_id=? AND meal_id=? AND status='VALID' ORDER BY id DESC LIMIT 1`,
+    [elderId, mealId]
+  );
+  return mapVerification(r[0]);
+}
+async function createVerification(d) {
+  const [x] = await getPool().query(
+    `INSERT INTO verification_records
+     (order_id,elder_id,meal_id,canteen_id,verifier_id,pickup_type,proxy_auth_id,proxy_name,proxy_id_code,verify_channel,offline_token,verified_at,synced_at,sync_batch_id,status,conflict_note)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [d.orderId, d.elderId, d.mealId, d.canteenId, d.verifierId ?? null, d.pickupType || 'SELF',
+     d.proxyAuthId ?? null, d.proxyName ?? null, d.proxyIdCode ?? null,
+     d.verifyChannel || 'ONLINE', d.offlineToken ?? null, toMysqlDateTime(d.verifiedAt),
+     d.syncedAt ? toMysqlDateTime(d.syncedAt) : null, d.syncBatchId ?? null, d.status || 'VALID', d.conflictNote ?? null]
+  );
+  return getVerificationById(x.insertId);
+}
+async function updateVerificationStatus(id, status, conflictNote) {
+  await getPool().query(
+    `UPDATE verification_records SET status=?, conflict_note=? WHERE id=?`,
+    [status, conflictNote ?? null, id]
+  );
+  return getVerificationById(id);
+}
+
+/* ----------------------------- 离线补传批次 ----------------------------- */
+async function listSyncBatches({ canteenId, status } = {}) {
+  const w = []; const p = [];
+  if (canteenId !== undefined) { w.push('canteen_id=?'); p.push(canteenId); }
+  if (status) { w.push('status=?'); p.push(status); }
+  const c = w.length ? `WHERE ${w.join(' AND ')}` : '';
+  const [r] = await getPool().query(`SELECT * FROM offline_sync_batches ${c} ORDER BY id DESC`, p);
+  return r.map(mapSyncBatch);
+}
+async function getSyncBatchById(id) {
+  const [r] = await getPool().query('SELECT * FROM offline_sync_batches WHERE id=?', [id]);
+  return mapSyncBatch(r[0]);
+}
+async function getSyncBatchByCode(code) {
+  const [r] = await getPool().query('SELECT * FROM offline_sync_batches WHERE batch_code=?', [code]);
+  return mapSyncBatch(r[0]);
+}
+async function createSyncBatch(d) {
+  const [x] = await getPool().query(
+    `INSERT INTO offline_sync_batches (canteen_id,operator_id,batch_code,record_count,status,summary)
+     VALUES (?,?,?,?,?,?)`,
+    [d.canteenId, d.operatorId, d.batchCode, d.recordCount || 0, d.status || 'PENDING', d.summary ?? null]
+  );
+  return getSyncBatchById(x.insertId);
+}
+async function updateSyncBatch(id, d) {
+  const map = { recordCount: 'record_count', status: 'status', summary: 'summary' };
+  const sets = []; const p = [];
+  for (const [k, col] of Object.entries(map)) if (d[k] !== undefined) { sets.push(`${col}=?`); p.push(d[k]); }
+  if (d.processedAt !== undefined) { sets.push('processed_at=?'); p.push(toMysqlDateTime(d.processedAt)); }
+  if (sets.length) { p.push(id); await getPool().query(`UPDATE offline_sync_batches SET ${sets.join(',')} WHERE id=?`, p); }
+  return getSyncBatchById(id);
+}
+
+/* ----------------------------- 冲突裁决记录 ----------------------------- */
+async function listConflicts({ orderId, syncBatchId, conflictType } = {}) {
+  const w = []; const p = [];
+  if (orderId !== undefined) { w.push('order_id=?'); p.push(orderId); }
+  if (syncBatchId !== undefined) { w.push('sync_batch_id=?'); p.push(syncBatchId); }
+  if (conflictType) { w.push('conflict_type=?'); p.push(conflictType); }
+  const c = w.length ? `WHERE ${w.join(' AND ')}` : '';
+  const [r] = await getPool().query(`SELECT * FROM verification_conflicts ${c} ORDER BY id DESC`, p);
+  return r.map(mapConflict);
+}
+async function getConflictById(id) {
+  const [r] = await getPool().query('SELECT * FROM verification_conflicts WHERE id=?', [id]);
+  return mapConflict(r[0]);
+}
+async function createConflict(d) {
+  const [x] = await getPool().query(
+    `INSERT INTO verification_conflicts
+     (sync_batch_id,order_id,offline_token,offline_verified_at,existing_status,existing_verified_at,conflict_type,resolution,note)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [d.syncBatchId ?? null, d.orderId, d.offlineToken ?? null, toMysqlDateTime(d.offlineVerifiedAt),
+     d.existingStatus, d.existingVerifiedAt ? toMysqlDateTime(d.existingVerifiedAt) : null, d.conflictType, d.resolution, d.note ?? null]
+  );
+  return getConflictById(x.insertId);
+}
+
+/* ----------------------------- 事务支持 ----------------------------- */
+async function withTransaction(fn) {
+  const conn = await getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const result = await fn(conn);
+    await conn.commit();
+    return result;
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
 
 module.exports = {
-  mapUser, mapCanteen, mapElder, mapMeal, mapOrder,
+  mapUser, mapCanteen, mapElder, mapMeal, mapOrder, mapAuthorization, mapVerification, mapSyncBatch, mapConflict,
   getUserByUsername, getUserById, listUsers, createUser, updateUser, deleteUser, countUsers,
   listCanteens, getCanteenById, getCanteenByCode, createCanteen, updateCanteen, deleteCanteen,
   listElders, getElderById, getElderByCode, createElder, updateElder, deleteElder,
   listMeals, getMealById, createMeal, updateMeal, deleteMeal,
-  listOrders, getOrderById, createOrder, updateOrder,
+  listOrders, getOrderById, getOrderByElderAndMeal, createOrder, updateOrder,
+  listAuthorizations, getAuthorizationById, findActiveAuthorization, createAuthorization, revokeAuthorization, updateAuthorization,
+  listVerifications, getVerificationById, getVerificationByOfflineToken, getValidVerificationByElderAndMeal, createVerification, updateVerificationStatus,
+  listSyncBatches, getSyncBatchById, getSyncBatchByCode, createSyncBatch, updateSyncBatch,
+  listConflicts, getConflictById, createConflict,
+  withTransaction,
 };

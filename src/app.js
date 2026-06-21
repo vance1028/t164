@@ -9,6 +9,8 @@ const canteensRouter = require('./routes/canteens');
 const eldersRouter = require('./routes/elders');
 const mealsRouter = require('./routes/meals');
 const ordersRouter = require('./routes/orders');
+const authorizationsRouter = require('./routes/authorizations');
+const { router: verificationsRouter } = require('./routes/verifications');
 const { sendError } = require('./utils/http');
 
 function createApp() {
@@ -26,6 +28,8 @@ function createApp() {
   app.use('/api/elders', eldersRouter);
   app.use('/api/meals', mealsRouter);
   app.use('/api/orders', ordersRouter);
+  app.use('/api/authorizations', authorizationsRouter);
+  app.use('/api/verifications', verificationsRouter);
 
   app.use((req, res) => sendError(res, 404, '接口不存在'));
 
